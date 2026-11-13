@@ -1,11 +1,90 @@
 import User from "../models/User.js";
 import {
-  fetchNasaPowerData,
-  getMlRecommendation,
+  assessCoordinates,
   getSmartCropRecommendation,
   lookupCoordinates,
 } from "../services/nasaPowerService.js";
 import Farm from "../models/Farm.js";
+
+const MODEL_LABEL =
+  "ml-cart in-memory decision tree (True ML / 16-Hub Scaled Framework)";
+
+function confidenceLabel(assessment) {
+  return assessment.supported
+    ? "Dynamic Leaf Assessment"
+    : "Unavailable outside supported region";
+}
+
+function sharedAiFields(assessment) {
+  const rec = assessment.recommendation;
+  return {
+    confidenceScore: confidenceLabel(assessment),
+    reasoning: rec.reasoning,
+    confidence: rec.confidence ?? null,
+    zone: assessment.supported ? rec.zoneName : null,
+    zoneId: assessment.supported ? rec.zoneId : null,
+    crops: rec.cropDetails ?? [],
+    supported: assessment.supported,
+  };
+}
+
+function sharedEnvelope(assessment) {
+  return {
+    success: true,
+    supported: assessment.supported,
+    message: assessment.message,
+    provenance: assessment.provenance,
+    warnings: assessment.warnings,
+    climateSummary: assessment.climateSummary,
+    moisture: assessment.moisture,
+  };
+}
+
+// Dashboard (/api/personal-recommendations). `crop` stays the zone string.
+export function toPersonalResponse(assessment, farm) {
+  return {
+    ...sharedEnvelope(assessment),
+    dataSource: assessment.dataSource,
+    farm: {
+      searchedQuery: farm.searchedQuery,
+      resolvedLocation: farm.locationName,
+      coordinates: { lat: farm.lat, lng: farm.lng },
+      currentCrop: farm.currentCrop,
+      fieldSize: farm.fieldSize,
+    },
+    aiRecommendation: {
+      crop: assessment.recommendation.name,
+      ...sharedAiFields(assessment),
+      model: MODEL_LABEL,
+    },
+  };
+}
+
+// Map / recommendations (/api/climate-recommendations).
+export function toFarmResponse(assessment, farm) {
+  return {
+    ...sharedEnvelope(assessment),
+    dataSource: assessment.dataSource,
+    farmDetails: {
+      locationName: farm.locationName,
+      coordinates: { lat: farm.lat, lng: farm.lng },
+      currentCrop: farm.currentCrop,
+      fieldSize: `${farm.fieldSize} Hectares`,
+    },
+    liveWeather: assessment.liveWeather || null,
+    aiRecommendation: {
+      suggestedAdaptiveCrop: assessment.recommendation.name,
+      ...sharedAiFields(assessment),
+      modelEngine: MODEL_LABEL,
+    },
+  };
+}
+
+function sendAssessmentError(res, err) {
+  const status = err.status || (err instanceof RangeError ? 400 : 500);
+  if (status >= 500) console.log(err);
+  return res.status(status).json({ success: false, error: err.message });
+}
 
 export async function getClimateAndRecommendations(req, res) {
   try {
@@ -35,40 +114,23 @@ export async function getClimateAndRecommendations(req, res) {
     const currentCrop = userFarm.currentCrop;
     const fieldSize = userFarm.fieldSize;
 
-    // 3. Call your hybrid function which queries BOTH NASA POWER and OpenWeatherMap concurrently
+    // Same assessment the dashboard uses, including the saved pin coordinates.
     const hybridResult = await getSmartCropRecommendation(lat, lng);
 
-    // 4. Return complete unified response package to dashboard client interface
-    return res.json({
-      success: true,
-      dataSource: hybridResult.dataSource,
-      farmDetails: {
+    return res.json(
+      toFarmResponse(hybridResult, {
         locationName,
-        coordinates: { lat, lng },
+        lat,
+        lng,
         currentCrop,
-        fieldSize: `${fieldSize} Hectares`,
-      },
-      climateSummary: {
-        averageTemperatureC: parseFloat(hybridResult.telemetry.avgTemp),
-        totalPrecipitationMm: parseFloat(hybridResult.telemetry.totalRain),
-        averageSolarRadiation: parseFloat(hybridResult.telemetry.avgSolar),
-      },
-      // 5. Now safely passing real-time OpenWeatherMap metrics to your client dashboard
-      liveWeather: hybridResult.liveWeather || null, 
-      aiRecommendation: {
-        suggestedAdaptiveCrop: hybridResult.recommendation.name,
-        confidenceScore: "Dynamic Leaf Assessment",
-        reasoning: hybridResult.recommendation.reasoning,
-        modelEngine: "ml-cart in-memory decision tree (True ML / 16-Hub Scaled Framework)",
-      },
-    });
+        fieldSize,
+      }),
+    );
   } catch (err) {
-    return res.status(500).json({ success: false, error: err.message });
+    return sendAssessmentError(res, err);
   }
 }
 
-
-// Import the lookup function alongside your other modules
 
 export async function getPersonalizedClimateAndRecommendations(req, res) {
   try {
@@ -114,68 +176,23 @@ export async function getPersonalizedClimateAndRecommendations(req, res) {
     const currentCrop = user.currentCrop || "Maize";
     const fieldSize = user.fieldSize || 2.5;
 
-    const { start, end } = req.query;
-    const formattedStart = start ? start.replace(/-/g, "") : "20250101";
-    const formattedEnd = end ? end.replace(/-/g, "") : "20251231";
+    // Same window, rainfall annualisation, and coordinates as the map path.
+    const assessment = await assessCoordinates(lat, lng, {
+      start: req.query.start,
+      end: req.query.end,
+    });
 
-    // 3. Fetch real agroclimatic satellite datasets for resolved positions
-    const nasaData = await fetchNasaPowerData(
-      lat,
-      lng,
-      formattedStart,
-      formattedEnd,
-    );
-    const properties = nasaData?.properties?.parameter || {};
-
-    const temps = Object.values(properties.T2M || {}).filter(
-      (val) => val !== -999,
-    );
-    const rains = Object.values(properties.PRECTOTCORR || {}).filter(
-      (val) => val !== -999,
-    );
-    const solars = Object.values(properties.ALLSKY_SFC_SW_DWN || {}).filter(
-      (val) => val !== -999,
-    );
-
-    if (!temps.length || !rains.length || !solars.length) {
-      return res.status(422).json({
-        success: false,
-        error:
-          "NASA POWER data is unavailable for resolved spatial layouts. Please refine registration details.",
-      });
-    }
-
-    const avgTemp = temps.reduce((a, b) => a + b, 0) / temps.length;
-    const totalRain = rains.reduce((a, b) => a + b, 0);
-    const avgSolar = solars.reduce((a, b) => a + b, 0) / solars.length;
-
-    // 4. TRUE ML INFERENCE
-    const aiResult = getMlRecommendation(avgTemp, totalRain, avgSolar);
-
-    return res.json({
-      success: true,
-      farm: {
+    return res.json(
+      toPersonalResponse(assessment, {
         searchedQuery: rawUserRegion,
-        resolvedLocation: locationName,
-        coordinates: { lat, lng },
+        locationName,
+        lat,
+        lng,
         currentCrop,
         fieldSize,
-      },
-      climateSummary: {
-        averageTemperatureC: parseFloat(avgTemp.toFixed(1)),
-        totalPrecipitationMm: parseFloat(totalRain.toFixed(1)),
-        averageSolarRadiation: parseFloat(avgSolar.toFixed(2)),
-      },
-      aiRecommendation: {
-        crop: aiResult.name,
-        confidenceScore: "Dynamic Leaf Assessment",
-        reasoning: aiResult.reasoning,
-        model:
-          "ml-cart in-memory decision tree (True ML / 16-Hub Scaled Framework)",
-      },
-    });
+      }),
+    );
   } catch (err) {
-    console.log(err);
-    return res.status(500).json({ success: false, error: err.message });
+    return sendAssessmentError(res, err);
   }
 }
