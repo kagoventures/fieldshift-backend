@@ -1,5 +1,7 @@
 
 const NASA_URL = "https://power.larc.nasa.gov/api/temporal/daily/point";
+const NASA_PARAMETERS = ["T2M", "PRECTOTCORR", "ALLSKY_SFC_SW_DWN"];
+const NASA_COMMUNITY = "AG";
 const OWM_URL = "https://api.openweathermap.org/data/2.5/weather";
 const NOMINATIM_URL = "https://nominatim.openstreetmap.org/search";
 const NOMINATIM_USER_AGENT =
@@ -133,7 +135,7 @@ const CROP_MAP = {
     soilNutrients: "Light lithosols and sandy loams",
   },
   6: {
-    name: " Peri-Urban Savannah (Maize, Okra, Pepper, Cassava)",
+    name: "Peri-Urban Savannah (Maize, Okra, Pepper, Cassava)",
     reasoning:
       "Coastal savannah microclimate with moderate rainfall and warm breezes favors fast-maturing vegetables and drought-resilient staples.",
     cropPool: [
@@ -407,22 +409,44 @@ const isInGhana = (lat, lng) =>
   lng >= GHANA_BOUNDS.minLng &&
   lng <= GHANA_BOUNDS.maxLng;
 
-// Last full calendar year, so training and prediction 
+// Last full calendar year, so training and prediction use the same closed window.
 function defaultWindow() {
   const year = new Date().getUTCFullYear() - 1;
   return { start: `${year}0101`, end: `${year}1231` };
 }
 
+function normalizePowerDate(value, fallback) {
+  if (value == null || value === "") return fallback;
+  const digits = String(value).trim().replace(/-/g, "");
+  if (!/^\d{8}$/.test(digits)) {
+    throw new RangeError(`Invalid NASA POWER date: ${value}`);
+  }
+  return digits;
+}
+
+function resolveWindow(start, end) {
+  const win = defaultWindow();
+  const resolved = {
+    start: normalizePowerDate(start, win.start),
+    end: normalizePowerDate(end, win.end),
+  };
+  if (resolved.start > resolved.end) {
+    throw new RangeError(
+      `NASA POWER start ${resolved.start} is after end ${resolved.end}`,
+    );
+  }
+  return resolved;
+}
 
 export async function fetchNasaPowerData(lat, lng, start, end) {
-  const win = defaultWindow();
+  const win = resolveWindow(start, end);
   const params = new URLSearchParams({
-    parameters: "T2M,PRECTOTCORR,ALLSKY_SFC_SW_DWN",
-    community: "AG",
+    parameters: NASA_PARAMETERS.join(","),
+    community: NASA_COMMUNITY,
     longitude: lng,
     latitude: lat,
-    start: start ?? win.start,
-    end: end ?? win.end,
+    start: win.start,
+    end: win.end,
     format: "JSON",
   });
   const data = await fetchJson(`${NASA_URL}?${params}`, {
@@ -453,13 +477,20 @@ export function processNasaTelemetry(nasaJson) {
   };
 }
 
-async function getNasaTelemetry(lat, lng) {
-  const key = `${lat.toFixed(2)}|${lng.toFixed(2)}|${defaultWindow().start}`;
+async function getNasaTelemetry(lat, lng, start, end) {
+  const win = resolveWindow(start, end);
+  const key = `${lat.toFixed(2)}|${lng.toFixed(2)}|${win.start}|${win.end}`;
   const hit = nasaCache.get(key);
   if (hit) return hit;
 
-  const telemetry = processNasaTelemetry(await fetchNasaPowerData(lat, lng));
-  if (!telemetry) throw new Error("NASA POWER returned no usable data");
+  const telemetry = processNasaTelemetry(
+    await fetchNasaPowerData(lat, lng, win.start, win.end),
+  );
+  if (!telemetry) {
+    const err = new Error("NASA POWER returned no usable data");
+    err.status = 422;
+    throw err;
+  }
   nasaCache.set(key, telemetry);
   return telemetry;
 }
@@ -585,6 +616,17 @@ export function initAiModel() {
   return initModelFromNasa();
 }
 
+// Deterministic model from the published station baselines. Used by the zone
+// check so both endpoints can be compared without calling NASA.
+export function initModelFromBaselines() {
+  const hubs = REFERENCE_HUBS.map((hub) => ({
+    ...hub,
+    climate: { ...hub.baseline },
+  }));
+  model = buildModel(hubs, true);
+  return model;
+}
+
 async function ensureModel() {
   if (!model) {
     await initModelFromNasa();
@@ -655,44 +697,148 @@ function pickCrops(pool, lat, lng, count = 5) {
 
 const shortZoneName = (zone) => zone.name.split("(")[0].trim();
 
+const OUT_OF_REGION_MESSAGE =
+  "These coordinates are outside Ghana. FieldShift agroecological zones and crop recommendations cover Ghana only, so no zone was assigned.";
 
-// 4. Public prediction + recommendation API
+function roundTo(value, digits) {
+  const factor = 10 ** digits;
+  return Math.round(value * factor) / factor;
+}
 
-export function getMlRecommendation(
-  avgTemp,
-  totalRain,
-  avgSolar,
-  lat = 5.6,
-  lng = -0.2,
-  liveWeather = null,
-) {
+// Words follow the rainfall total. They are not copied from a zone blurb,
+// so a wet site can never be described as a severe moisture deficit.
+export function assessMoisture(totalRainMm) {
+  const rain = Math.round(Number(totalRainMm));
+  if (!Number.isFinite(rain)) {
+    return {
+      level: "unknown",
+      annualRainfallMm: null,
+      summary: "Annual rainfall is unavailable.",
+    };
+  }
+
+  let level;
+  let summary;
+  if (rain < 600) {
+    level = "severe deficit";
+    summary = `Annual rainfall is ${rain} mm, a severe moisture deficit.`;
+  } else if (rain < 900) {
+    level = "low";
+    summary = `Annual rainfall is ${rain} mm, low moisture suited to a short single rainy season.`;
+  } else if (rain < 1200) {
+    level = "moderate";
+    summary = `Annual rainfall is ${rain} mm, moderate moisture for a single rainy season.`;
+  } else if (rain < 1600) {
+    level = "high";
+    summary = `Annual rainfall is ${rain} mm, high moisture.`;
+  } else {
+    level = "very high";
+    summary = `Annual rainfall is ${rain} mm, very high moisture.`;
+  }
+  return { level, annualRainfallMm: rain, summary };
+}
+
+function composeReasoning(zone, moisture) {
+  const staticText = zone.reasoning.trim();
+  const contradicts =
+    /severe moisture deficit/i.test(staticText) &&
+    moisture.level !== "severe deficit";
+  return contradicts ? moisture.summary : `${staticText} ${moisture.summary}`;
+}
+
+function buildCropDetails(crops, zoneName, moisture, confidence) {
+  return crops.map((name, index) => ({
+    name,
+    confidence: Number((confidence * (1 - index * 0.08)).toFixed(2)),
+    reason:
+      index < 2
+        ? `${name} is a lead crop for ${zoneName}. ${moisture.summary}`
+        : `${name} is a companion crop for ${zoneName}. ${moisture.summary}`,
+  }));
+}
+
+function climateSummaryFrom(climate) {
+  return {
+    averageTemperatureC: roundTo(climate.avgTemp, 1),
+    totalPrecipitationMm: roundTo(climate.totalRain, 0),
+    averageSolarRadiation: roundTo(climate.avgSolar, 2),
+  };
+}
+
+function formatTelemetry(climate) {
+  return {
+    avgTemp: climate.avgTemp.toFixed(1),
+    totalRain: climate.totalRain.toFixed(0),
+    avgSolar: climate.avgSolar.toFixed(1),
+  };
+}
+
+function buildProvenance(win, estimated) {
+  return {
+    source: estimated ? "Regional baseline estimate" : "NASA POWER",
+    parameters: [...NASA_PARAMETERS],
+    dateRange: { start: win.start, end: win.end },
+    community: NASA_COMMUNITY,
+  };
+}
+
+function unsupportedRecommendation(message, moisture, liveWeather) {
+  return {
+    name: "Unsupported location",
+    zoneName: null,
+    zoneId: null,
+    supported: false,
+    reasoning: `${message} ${moisture.summary}`,
+    recommendedCrops: [],
+    primaryStaples: [],
+    cashAndCompanionCrops: [],
+    cropDetails: [],
+    cropPool: [],
+    optimalConditions: null,
+    soilNutrients: null,
+    confidence: null,
+    nearestReferenceStation: null,
+    alternativeZones: [],
+    liveConditionNote: liveWeather
+      ? `Live conditions in ${liveWeather.stationName || "area"}: ${liveWeather.temp}°C, ${liveWeather.humidity}% humidity. No crop zone was assigned because this point is outside Ghana.`
+      : message,
+  };
+}
+
+function recommendInRegion(climate, coords, liveWeather, moisture) {
   if (!model) {
     throw new Error("Model not initialised. Await initAiModel() first.");
   }
-  const coords = validateCoords(lat, lng);
   const result = classify(
     model,
-    avgTemp,
-    totalRain,
-    avgSolar,
+    climate.avgTemp,
+    climate.totalRain,
+    climate.avgSolar,
     coords.lat,
     coords.lng,
   );
   const zone = CROP_MAP[result.zone];
+  const zoneName = shortZoneName(zone);
   const crops = pickCrops(zone.cropPool, coords.lat, coords.lng);
+  const confidence = Number(result.confidence.toFixed(2));
 
   return {
     ...zone,
-    name: `${shortZoneName(zone)} (${crops.slice(0, 4).join(", ")})`,
+    name: `${zoneName} (${crops.slice(0, 4).join(", ")})`,
+    zoneName,
+    zoneId: result.zone,
+    supported: true,
+    reasoning: composeReasoning(zone, moisture),
     recommendedCrops: crops,
     primaryStaples: crops.slice(0, 2),
     cashAndCompanionCrops: crops.slice(2),
-    confidence: Number(result.confidence.toFixed(2)),
+    cropDetails: buildCropDetails(crops, zoneName, moisture, confidence),
+    confidence,
     nearestReferenceStation: result.nearestHub.name,
-    alternativeZones: result.alternatives.map((a) => ({
-      zoneId: a.zone,
-      name: shortZoneName(CROP_MAP[a.zone]),
-      confidence: Number(a.confidence.toFixed(2)),
+    alternativeZones: result.alternatives.map((alt) => ({
+      zoneId: alt.zone,
+      name: shortZoneName(CROP_MAP[alt.zone]),
+      confidence: Number(alt.confidence.toFixed(2)),
     })),
     liveConditionNote: liveWeather
       ? `Live conditions in ${liveWeather.stationName || "area"}: ${liveWeather.temp}°C, ${liveWeather.humidity}% humidity (shown for context; the zone is based on the annual climate profile).`
@@ -700,15 +846,92 @@ export function getMlRecommendation(
   };
 }
 
-export async function getSmartCropRecommendation(lat, lng) {
+
+// 4. Public prediction + recommendation API
+// Single path for both endpoints. Coordinates are required: omitting them used
+// to fall back to Accra and assign a coastal zone to inland farms.
+
+export function getMlRecommendation(
+  avgTemp,
+  totalRain,
+  avgSolar,
+  lat,
+  lng,
+  liveWeather = null,
+) {
   const coords = validateCoords(lat, lng);
-  const m = await ensureModel();
-  const warnings = [];
+  const climate = { avgTemp, totalRain, avgSolar };
+  const moisture = assessMoisture(totalRain);
   if (!isInGhana(coords.lat, coords.lng)) {
-    warnings.push(
-      "Coordinates are outside Ghana; zone recommendations may not apply.",
+    return unsupportedRecommendation(
+      OUT_OF_REGION_MESSAGE,
+      moisture,
+      liveWeather,
     );
   }
+  return recommendInRegion(climate, coords, liveWeather, moisture);
+}
+
+/**
+ * Shared climate, zone, and crop decision for a coordinate pair.
+ * Both /api/personal-recommendations and /api/climate-recommendations use this.
+ * Pass `climate` to skip the NASA fetch (tests and the map path, which fetches
+ * NASA and OpenWeather together).
+ */
+export async function assessCoordinates(lat, lng, options = {}) {
+  const coords = validateCoords(lat, lng);
+  const win = resolveWindow(options.start, options.end);
+  const supported = isInGhana(coords.lat, coords.lng);
+  const estimated = Boolean(options.estimated);
+
+  const climate =
+    options.climate ??
+    (await getNasaTelemetry(coords.lat, coords.lng, win.start, win.end));
+  const moisture = assessMoisture(climate.totalRain);
+  const warnings = [...(options.extraWarnings ?? [])];
+  const liveWeather = options.liveWeather ?? null;
+  const provenance = buildProvenance(win, estimated);
+
+  let recommendation;
+  let message = null;
+  if (!supported) {
+    message = OUT_OF_REGION_MESSAGE;
+    warnings.unshift(message);
+    recommendation = unsupportedRecommendation(message, moisture, liveWeather);
+  } else {
+    await ensureModel();
+    recommendation = recommendInRegion(climate, coords, liveWeather, moisture);
+  }
+
+  const dataSource =
+    options.dataSource ??
+    (estimated
+      ? "Offline Regional Baseline Estimate"
+      : "NASA POWER Satellite Telemetry");
+
+  log.debug(
+    `[${coords.lat}, ${coords.lng}] supported=${supported} -> ${recommendation.name}`,
+  );
+
+  return {
+    supported,
+    message,
+    warnings,
+    dataSource,
+    provenance,
+    moisture,
+    coordinates: coords,
+    climate,
+    climateSummary: climateSummaryFrom(climate),
+    telemetry: formatTelemetry(climate),
+    liveWeather,
+    recommendation,
+  };
+}
+
+export async function getSmartCropRecommendation(lat, lng) {
+  const coords = validateCoords(lat, lng);
+  const inGhana = isInGhana(coords.lat, coords.lng);
 
   // Fetch both sources independently so one failing doesn't discard the other.
   const [nasaResult, owmResult] = await Promise.allSettled([
@@ -720,49 +943,39 @@ export async function getSmartCropRecommendation(lat, lng) {
 
   let climate;
   let dataSource;
+  let estimated = false;
+  const extraWarnings = [];
+
   if (nasaResult.status === "fulfilled") {
     climate = nasaResult.value;
     dataSource = liveWeather
       ? "NASA POWER Satellite Telemetry + OpenWeatherMap Real-Time API"
       : "NASA POWER Satellite Telemetry";
-  } else {
+  } else if (inGhana) {
     log.warn(
       "NASA POWER failed, estimating from nearby stations:",
       nasaResult.reason?.message,
     );
+    const m = await ensureModel();
     climate = estimateClimateFromHubs(m, coords.lat, coords.lng);
+    estimated = true;
     dataSource = liveWeather
       ? "Regional Baseline Estimate + OpenWeatherMap Real-Time API"
       : "Offline Regional Baseline Estimate";
-    warnings.push(
+    extraWarnings.push(
       "NASA POWER unavailable; climate estimated from nearby reference stations.",
     );
+  } else {
+    throw nasaResult.reason;
   }
 
-  const recommendation = getMlRecommendation(
-    climate.avgTemp,
-    climate.totalRain,
-    climate.avgSolar,
-    coords.lat,
-    coords.lng,
+  return assessCoordinates(coords.lat, coords.lng, {
+    climate,
     liveWeather,
-  );
-
-  log.debug(
-    `[${coords.lat}, ${coords.lng}] -> ${recommendation.name} (confidence ${recommendation.confidence})`,
-  );
-
-  return {
     dataSource,
-    telemetry: {
-      avgTemp: climate.avgTemp.toFixed(1),
-      totalRain: climate.totalRain.toFixed(0),
-      avgSolar: climate.avgSolar.toFixed(1),
-    },
-    liveWeather,
-    recommendation,
-    warnings,
-  };
+    extraWarnings,
+    estimated,
+  });
 }
 
 
