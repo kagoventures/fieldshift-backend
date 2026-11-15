@@ -1,8 +1,7 @@
 import User from "../models/User.js";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
-
-const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret";
+import { getJwtSecret } from "../config/jwtSecret.js";
 
 export async function register(req, res) {
   try {
@@ -32,7 +31,7 @@ export async function register(req, res) {
 
     const token = jwt.sign(
       { userId: user._id, email: user.email },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: "7d" },
     );
 
@@ -71,7 +70,7 @@ export async function login(req, res) {
 
     const token = jwt.sign(
       { userId: user._id, email: user.email },
-      JWT_SECRET,
+      getJwtSecret(),
       { expiresIn: "7h" },
     );
 

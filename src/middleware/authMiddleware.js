@@ -1,6 +1,5 @@
 import jwt from "jsonwebtoken";
-
-const JWT_SECRET = process.env.JWT_SECRET || "fallback_secret";
+import { getJwtSecret } from "../config/jwtSecret.js";
 
 export function verifyToken(req, res, next) {
   const authHeader = req.headers.authorization;
@@ -14,10 +13,11 @@ export function verifyToken(req, res, next) {
   const token = authHeader.split(" ")[1];
 
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const decoded = jwt.verify(token, getJwtSecret());
     req.user = decoded; // { userId, email }
     next();
   } catch (err) {
+    if (err.code === "JWT_SECRET_MISSING") throw err;
     return res
       .status(403)
       .json({ success: false, error: "Invalid or expired token." });

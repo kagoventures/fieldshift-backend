@@ -1,57 +1,81 @@
+import "./src/config/loadEnv.js";
 import express from "express";
 import cors from "cors";
-import dotenv from "dotenv";
+import morgan from "morgan";
+import { realpathSync } from "node:fs";
+import { pathToFileURL } from "node:url";
 import { connectDB } from "./src/config/db.js";
+import { getJwtSecret } from "./src/config/jwtSecret.js";
 import apiRoutes from "./src/routes/apiRoutes.js";
-import morgan from 'morgan'; 
-// 1. IMPORT YOUR TRAINED ML MODULE ENGINE HERE
-import { initModelFromNasa } from "./src/services/nasaPowerService.js";
+import {
+  classifierInfo,
+  initModelFromNasa,
+} from "./src/services/nasaPowerService.js";
 
-dotenv.config();
-
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-// Middleware
-app.use(morgan('dev'));
-app.use(cors());
-app.use(express.json());
-
-// Routes
-app.use("/api", apiRoutes);
-
-app.get("/", (req, res) => {
-  res.json({
+export function buildStatusPayload() {
+  const classifier = classifierInfo();
+  return {
     status: "online",
     project: "Field Shift: Adapting Farms with NASA Data",
     database: "MongoDB with Mongoose",
-    engine: "ml-cart in-memory tree fully optimized",
-  });
-});
+    engine: classifier.description,
+    classifier,
+    publicDemo: {
+      latLng: "/api/public/assess?lat={lat}&lng={lng}",
+      region: "/api/public/assess?region={name}",
+      note: "No account required. Rate limited per IP.",
+    },
+  };
+}
 
-// 2. WRAP BOOT SEQUENCE IN AN ASYNC FUNCTION TO ENSURE DATA LIFTCYCLE LOADS IN ORDER
+export function createApp({ log = true } = {}) {
+  const app = express();
+  // Render terminates TLS and forwards the client address in one hop.
+  app.set("trust proxy", 1);
+  if (log) app.use(morgan("dev"));
+  app.use(cors());
+  app.use(express.json());
+  app.use("/api", apiRoutes);
+  app.get("/", (req, res) => {
+    res.json(buildStatusPayload());
+  });
+  return app;
+}
+
+const PORT = process.env.PORT || 5000;
+
 async function startApp() {
   try {
-    // Phase A: Establish your MongoDB cloud cluster connections
-    console.log("🗄️ Connecting to local database/cloud instance...");
+    // Fail here when production has no JWT_SECRET. A secret already set on
+    // Render is used as-is. Local development gets an ephemeral secret.
+    getJwtSecret();
+
+    console.log("Connecting to database...");
     await connectDB();
 
-    // Phase B: Fetch NASA data and compile your decision tree rules right into memory
-    console.log("🧠 Triggering Machine Learning model compilation loop...");
+    console.log("Loading NASA POWER reference hubs for the k-NN classifier...");
     await initModelFromNasa();
 
-    // Phase C: Open up ports for traffic once everything is successfully calibrated
+    const app = createApp();
     app.listen(PORT, () => {
-      console.log(`🚀 Field Shift backend running on http://localhost:${PORT}`);
+      console.log(`Field Shift backend running on http://localhost:${PORT}`);
     });
   } catch (error) {
-    console.error(
-      "🛑 Server pipeline crashed on boot execution:",
-      error.message,
-    );
+    console.error("Server failed during startup:", error.message);
     process.exit(1);
   }
 }
 
-// 3. EXECUTE REBOOT ENGINE RUNTIME
-startApp();
+function invokedDirectly() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(entry)).href;
+  } catch {
+    return false;
+  }
+}
+
+if (invokedDirectly()) {
+  startApp();
+}
