@@ -311,6 +311,20 @@ const REFERENCE_HUBS = [
   },
 ];
 
+export const CLASSIFIER_K = K_NEIGHBOURS;
+export const REFERENCE_HUB_COUNT = REFERENCE_HUBS.length;
+export const CLASSIFIER_LABEL = `k-NN (k=${CLASSIFIER_K}) over ${REFERENCE_HUB_COUNT} NASA POWER reference hubs`;
+export const SUPPORTED_CONFIDENCE_LABEL = `Weighted vote of the ${CLASSIFIER_K} nearest reference hubs`;
+
+export function classifierInfo() {
+  return {
+    method: "k-NN",
+    k: CLASSIFIER_K,
+    referenceHubs: REFERENCE_HUB_COUNT,
+    description: CLASSIFIER_LABEL,
+  };
+}
+
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const mean = (xs) => xs.reduce((a, b) => a + b, 0) / xs.length;
@@ -929,15 +943,19 @@ export async function assessCoordinates(lat, lng, options = {}) {
   };
 }
 
-export async function getSmartCropRecommendation(lat, lng) {
+export async function getSmartCropRecommendation(lat, lng, options = {}) {
   const coords = validateCoords(lat, lng);
   const inGhana = isInGhana(coords.lat, coords.lng);
 
   // Fetch both sources independently so one failing doesn't discard the other.
   const [nasaResult, owmResult] = await Promise.allSettled([
-    getNasaTelemetry(coords.lat, coords.lng),
+    getNasaTelemetry(coords.lat, coords.lng, options.start, options.end),
     fetchOpenWeatherMapData(coords.lat, coords.lng),
   ]);
+  if (nasaResult.status === "rejected" && nasaResult.reason instanceof RangeError) {
+    throw nasaResult.reason;
+  }
+
   const liveWeather =
     owmResult.status === "fulfilled" ? toLiveWeather(owmResult.value) : null;
 
@@ -975,6 +993,8 @@ export async function getSmartCropRecommendation(lat, lng) {
     dataSource,
     extraWarnings,
     estimated,
+    start: options.start,
+    end: options.end,
   });
 }
 

@@ -1,17 +1,19 @@
 import User from "../models/User.js";
 import {
   assessCoordinates,
+  CLASSIFIER_LABEL,
+  classifierInfo,
   getSmartCropRecommendation,
   lookupCoordinates,
+  SUPPORTED_CONFIDENCE_LABEL,
 } from "../services/nasaPowerService.js";
 import Farm from "../models/Farm.js";
 
-const MODEL_LABEL =
-  "ml-cart in-memory decision tree (True ML / 16-Hub Scaled Framework)";
+const MODEL_LABEL = CLASSIFIER_LABEL;
 
 function confidenceLabel(assessment) {
   return assessment.supported
-    ? "Dynamic Leaf Assessment"
+    ? SUPPORTED_CONFIDENCE_LABEL
     : "Unavailable outside supported region";
 }
 
@@ -25,6 +27,7 @@ function sharedAiFields(assessment) {
     zoneId: assessment.supported ? rec.zoneId : null,
     crops: rec.cropDetails ?? [],
     supported: assessment.supported,
+    classifier: classifierInfo(),
   };
 }
 
@@ -42,6 +45,11 @@ function sharedEnvelope(assessment) {
 
 // Dashboard (/api/personal-recommendations). `crop` stays the zone string.
 export function toPersonalResponse(assessment, farm) {
+  const recommendation = {
+    crop: assessment.recommendation.name,
+    ...sharedAiFields(assessment),
+    model: MODEL_LABEL,
+  };
   return {
     ...sharedEnvelope(assessment),
     dataSource: assessment.dataSource,
@@ -52,16 +60,19 @@ export function toPersonalResponse(assessment, farm) {
       currentCrop: farm.currentCrop,
       fieldSize: farm.fieldSize,
     },
-    aiRecommendation: {
-      crop: assessment.recommendation.name,
-      ...sharedAiFields(assessment),
-      model: MODEL_LABEL,
-    },
+    // Same object. `recommendation` is the honest name; `aiRecommendation` stays for the frontend.
+    recommendation,
+    aiRecommendation: recommendation,
   };
 }
 
 // Map / recommendations (/api/climate-recommendations).
 export function toFarmResponse(assessment, farm) {
+  const recommendation = {
+    suggestedAdaptiveCrop: assessment.recommendation.name,
+    ...sharedAiFields(assessment),
+    modelEngine: MODEL_LABEL,
+  };
   return {
     ...sharedEnvelope(assessment),
     dataSource: assessment.dataSource,
@@ -72,12 +83,107 @@ export function toFarmResponse(assessment, farm) {
       fieldSize: `${farm.fieldSize} Hectares`,
     },
     liveWeather: assessment.liveWeather || null,
-    aiRecommendation: {
-      suggestedAdaptiveCrop: assessment.recommendation.name,
-      ...sharedAiFields(assessment),
-      modelEngine: MODEL_LABEL,
-    },
+    recommendation,
+    aiRecommendation: recommendation,
   };
+}
+
+function firstQueryValue(value) {
+  const picked = Array.isArray(value) ? value[0] : value;
+  if (picked == null) return "";
+  return String(picked).trim();
+}
+
+export function toPublicResponse(assessment, location) {
+  const recommendation = {
+    crop: assessment.recommendation.name,
+    suggestedAdaptiveCrop: assessment.recommendation.name,
+    ...sharedAiFields(assessment),
+    model: MODEL_LABEL,
+    modelEngine: MODEL_LABEL,
+  };
+  return {
+    ...sharedEnvelope(assessment),
+    dataSource: assessment.dataSource,
+    location,
+    liveWeather: assessment.liveWeather || null,
+    recommendation,
+    aiRecommendation: recommendation,
+  };
+}
+
+// No login. Same NASA POWER assessment as the authenticated farm routes.
+export async function getPublicAssessment(req, res) {
+  try {
+    const latRaw = firstQueryValue(req.query.lat);
+    const lngRaw = firstQueryValue(req.query.lng);
+    const region = firstQueryValue(req.query.region);
+    if (region.length > 120) {
+      return res.status(400).json({
+        success: false,
+        error: "Region name is too long. Use a town name, or pass lat and lng.",
+      });
+    }
+    const hasLat = latRaw !== "";
+    const hasLng = lngRaw !== "";
+
+    if (hasLat !== hasLng) {
+      return res.status(400).json({
+        success: false,
+        error: "Provide both lat and lng, or a region name.",
+      });
+    }
+
+    let lat;
+    let lng;
+    let locationName;
+    let query = null;
+
+    if (hasLat && hasLng) {
+      lat = latRaw;
+      lng = lngRaw;
+      query = region || null;
+      locationName = region || null;
+    } else if (region) {
+      const found = await lookupCoordinates(region);
+      if (!found) {
+        return res.status(404).json({
+          success: false,
+          error: `No Ghana location found for "${region}". Try a town name, or pass lat and lng.`,
+        });
+      }
+      lat = found.lat;
+      lng = found.lng;
+      locationName = found.formattedName;
+      query = region;
+    } else {
+      return res.status(400).json({
+        success: false,
+        error:
+          "Provide lat and lng, or region. Example: /api/public/assess?lat=6.6885&lng=-1.6244 or /api/public/assess?region=Kumasi",
+      });
+    }
+
+    const assessment = await getSmartCropRecommendation(lat, lng, {
+      start: firstQueryValue(req.query.start) || undefined,
+      end: firstQueryValue(req.query.end) || undefined,
+    });
+
+    return res.json(
+      toPublicResponse(assessment, {
+        query,
+        name:
+          locationName ||
+          `${assessment.coordinates.lat}, ${assessment.coordinates.lng}`,
+        coordinates: {
+          lat: assessment.coordinates.lat,
+          lng: assessment.coordinates.lng,
+        },
+      }),
+    );
+  } catch (err) {
+    return sendAssessmentError(res, err);
+  }
 }
 
 function sendAssessmentError(res, err) {

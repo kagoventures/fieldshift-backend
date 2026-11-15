@@ -133,6 +133,26 @@ check(
   iowaAssessment.moisture.summary,
 );
 check(
+  "Classifier label matches the k-NN model, and the old field name still works",
+  personal.aiRecommendation.model ===
+    "k-NN (k=3) over 12 NASA POWER reference hubs" &&
+    farm.aiRecommendation.modelEngine === personal.aiRecommendation.model &&
+    personal.recommendation === personal.aiRecommendation &&
+    farm.recommendation === farm.aiRecommendation &&
+    personal.aiRecommendation.classifier?.method === "k-NN" &&
+    personal.aiRecommendation.classifier?.k === 3 &&
+    personal.aiRecommendation.classifier?.referenceHubs === 12 &&
+    farm.aiRecommendation.classifier?.referenceHubs === 12 &&
+    personal.aiRecommendation.confidenceScore ===
+      "Weighted vote of the 3 nearest reference hubs" &&
+    iowaPersonal.aiRecommendation.confidenceScore ===
+      "Unavailable outside supported region" &&
+    !/ml-cart|decision tree|16-hub|dynamic leaf/i.test(
+      JSON.stringify({ personal: personal.aiRecommendation, farm: farm.aiRecommendation }),
+    ),
+  personal.aiRecommendation.model,
+);
+check(
   "Responses include NASA POWER provenance and per-crop reasons",
   personal.provenance?.source === "NASA POWER" &&
     Array.isArray(personal.provenance.parameters) &&

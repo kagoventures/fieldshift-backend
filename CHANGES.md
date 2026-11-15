@@ -1,5 +1,12 @@
 # Changes
 
+## 15 Nov 2026 — Public demo, honest classifier name, required JWT secret
+
+- `GET /api/public/assess?lat=&lng=` and `GET /api/public/assess?region=` need no account. They call the same NASA POWER assessment as the logged-in routes (`getSmartCropRecommendation`). The route is rate limited (120 requests / 15 minutes / IP).
+- The live classifier is k-NN (k=3) over 12 NASA POWER reference hubs. Response labels and `GET /` say that. `ml-cart` was unused and has been removed. `aiRecommendation` is still present. `recommendation` is the same object.
+- `aiRecommendation.confidenceScore` inside Ghana is `Weighted vote of the 3 nearest reference hubs`.
+- `JWT_SECRET` is required when `NODE_ENV=production` (the process exits on boot if it is missing). A secret already set in the environment is used as-is. Development without one gets a one-process random secret and a warning. There is no `fallback_secret`.
+
 ## 13 Nov 2026 — One zone per coordinate, and no Ghana zone outside Ghana
 
 ### Why
@@ -50,7 +57,7 @@ Existing keys are still there. These are the ones added on both `GET /api/person
 | `aiRecommendation.crops` | `{ name, reason, confidence }[]`. Empty outside Ghana |
 | `aiRecommendation.supported` | same flag as the top-level `supported` |
 
-`aiRecommendation.confidenceScore` is still the string `"Dynamic Leaf Assessment"` inside Ghana. Outside Ghana it is `"Unavailable outside supported region"`.
+`aiRecommendation.confidenceScore` is `"Weighted vote of the 3 nearest reference hubs"` inside Ghana. Outside Ghana it is `"Unavailable outside supported region"`. `recommendation` is the same object as `aiRecommendation`.
 
 `climateSummary.totalPrecipitationMm` is now the same annualised whole-millimetre value on both routes. The dashboard used to return the raw sum of daily values, which under-counted years with missing days.
 
@@ -88,7 +95,7 @@ Bands used for `moisture.level`: under 600 mm severe deficit, 600–899 low, 900
     "suggestedAdaptiveCrop": "Ashanti & Forest Zone (Cocoa, Plantain, Yellow Yam, Maize)",
     "zone": "Ashanti & Forest Zone",
     "zoneId": 0,
-    "confidenceScore": "Dynamic Leaf Assessment",
+    "confidenceScore": "Weighted vote of the 3 nearest reference hubs",
     "confidence": 0.99,
     "reasoning": "High annual precipitation (>1,300mm) and dense canopy moisture profiles typical of the middle forest belt. Annual rainfall is 1500 mm, high moisture.",
     "crops": [
